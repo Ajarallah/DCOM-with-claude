@@ -18,3 +18,7 @@ View your app in AI Studio: https://ai.studio/apps/drive/1XOT5uO_K3Any0Xx-cmFI2Q
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+
+## Deployment
+This app is containerized with Docker and deployed on Google Cloud Run.
