@@ -1,9 +1,8 @@
-import { GoogleGenAI } from "@google/genai";
 import { KNOWLEDGE_BASE } from '../constants';
 import { AnalysisResponse, AnalysisSection, Source, AnalysisMode, ClarificationQuestion } from '../types';
 
-// Initialize the API client
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// API base URL - will use relative path in production
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 /**
  * Parses the raw markdown text from the model into structured AnalysisSections.
@@ -33,7 +32,7 @@ const parseSections = (text: string): AnalysisSection[] => {
       title: title,
       type: type,
       content: content,
-      isOpen: false 
+      isOpen: false
     });
   }
 
@@ -59,24 +58,35 @@ const parseGroundingSources = (groundingMetadata: any): Source[] => {
 
 export const generateClarificationQuestions = async (query: string): Promise<ClarificationQuestion[]> => {
   try {
-    const modelId = 'gemini-3-flash-preview'; 
-    const response = await ai.models.generateContent({
-      model: modelId,
-      contents: [{ 
-        role: 'user', 
-        parts: [{ 
-          text: `You are an expert analyst helper. The user asked: "${query}". 
-          Generate 3 clarifying questions to narrow down the scope for a deep strategic analysis. 
-          Return ONLY a JSON array with this structure: 
-          [{"id": "q1", "text": "Question text?", "options": ["Option 1", "Option 2", "Option 3"]}]
-          Do not wrap in markdown code blocks.` 
-        }] 
-      }],
-      config: { responseMimeType: 'application/json' }
+    const modelId = 'gemini-3-flash-preview';
+
+    const response = await fetch(`${API_BASE_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelId,
+        contents: [{
+          role: 'user',
+          parts: [{
+            text: `You are an expert analyst helper. The user asked: "${query}".
+            Generate 3 clarifying questions to narrow down the scope for a deep strategic analysis.
+            Return ONLY a JSON array with this structure:
+            [{"id": "q1", "text": "Question text?", "options": ["Option 1", "Option 2", "Option 3"]}]
+            Do not wrap in markdown code blocks.`
+          }]
+        }],
+        config: { responseMimeType: 'application/json' }
+      })
     });
 
-    if (response.text) {
-      return JSON.parse(response.text.trim());
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (data.text) {
+      return JSON.parse(data.text.trim());
     }
     return [];
   } catch (e) {
@@ -93,9 +103,9 @@ const generateThinkingStream = async (
   onThoughtUpdate: (paragraphs: string[]) => void
 ): Promise<string> => {
   const thinkingSystemPrompt = `
-    You are an AI assistant engaging in "Deep Thinking" mode. 
+    You are an AI assistant engaging in "Deep Thinking" mode.
     Your goal is to show your INTERNAL REASONING PROCESS before answering the user's question.
-    
+
     The user asked: "${query}"
 
     INSTRUCTIONS:
@@ -107,33 +117,71 @@ const generateThinkingStream = async (
     6. Write 3-5 short paragraphs.
   `;
 
-  // UPDATED: Ensure Pro model is used for deep reasoning
-  const thinkingModelId = 'gemini-3-pro-preview'; 
+  const thinkingModelId = 'gemini-3-pro-preview';
 
   let thinkingParagraphs: string[] = [];
   let buffer = "";
 
   try {
-    const streamResult = await ai.models.generateContentStream({
-      model: thinkingModelId,
-      contents: [{ role: 'user', parts: [{ text: thinkingSystemPrompt }] }],
+    const response = await fetch(`${API_BASE_URL}/api/generate-stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: thinkingModelId,
+        contents: [{ role: 'user', parts: [{ text: thinkingSystemPrompt }] }],
+      })
     });
 
-    for await (const chunk of streamResult) {
-      const text = chunk.text;
-      if (text) {
-        for (const char of text) {
-          buffer += char;
-          
-          if (buffer.endsWith('\n\n') || (buffer.length > 200 && buffer.endsWith('. '))) {
-             thinkingParagraphs.push(buffer.trim());
-             buffer = "";
-             onThoughtUpdate([...thinkingParagraphs]);
-             await new Promise(resolve => setTimeout(resolve, 800));
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+
+    if (!reader) {
+      throw new Error('ReadableStream not supported');
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+
+          if (data === '[DONE]') {
+            break;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            const text = parsed.text || '';
+
+            if (text) {
+              for (const char of text) {
+                buffer += char;
+
+                if (buffer.endsWith('\n\n') || (buffer.length > 200 && buffer.endsWith('. '))) {
+                   thinkingParagraphs.push(buffer.trim());
+                   buffer = "";
+                   onThoughtUpdate([...thinkingParagraphs]);
+                   await new Promise(resolve => setTimeout(resolve, 800));
+                }
+              }
+            }
+          } catch (e) {
+            // Skip malformed JSON
           }
         }
       }
     }
+
     // Flush remaining buffer
     if (buffer.trim()) {
       thinkingParagraphs.push(buffer.trim());
@@ -158,9 +206,8 @@ const generateStructuredAnalysis = async (
   useWeb: boolean,
   onAnalysisUpdate: (text: string, sources: Source[]) => void
 ) => {
-  // UPDATED: Ensure Pro model is used for deep analysis
-  const modelId = 'gemini-3-pro-preview'; 
-  
+  const modelId = 'gemini-3-pro-preview';
+
   const systemInstruction = `
 You are StratIntel AI, an elite strategic intelligence engine.
 Your goal is to provide deep, multi-dimensional analysis based on the user's query and your internal reasoning.
@@ -198,31 +245,73 @@ INSTRUCTIONS:
   let sources: Source[] = [];
 
   try {
-    const streamResult = await ai.models.generateContentStream({
-      model: modelId,
-      contents: [{ role: 'user', parts: [{ text: "Proceed with the structured analysis." }] }],
-      config: config
+    const response = await fetch(`${API_BASE_URL}/api/generate-stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: modelId,
+        contents: [{ role: 'user', parts: [{ text: "Proceed with the structured analysis." }] }],
+        config: config
+      })
     });
 
-    for await (const chunk of streamResult) {
-      if (chunk.candidates && chunk.candidates[0]) {
-         const parts = chunk.candidates[0].content.parts;
-         for (const part of parts) {
-            if (part.text) {
-               fullText += part.text;
-               onAnalysisUpdate(fullText, sources);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+
+    if (!reader) {
+      throw new Error('ReadableStream not supported');
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+
+          if (data === '[DONE]') {
+            break;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+
+            if (parsed.error) {
+              throw new Error(parsed.error);
             }
-         }
-         
-         if (chunk.candidates[0].groundingMetadata) {
-            const webSources = parseGroundingSources(chunk.candidates[0].groundingMetadata);
-            webSources.forEach(ws => {
-              if (!sources.find(s => s.url === ws.url)) {
-                sources.push(ws);
+
+            if (parsed.candidates && parsed.candidates[0]) {
+              const parts = parsed.candidates[0].content.parts;
+              for (const part of parts) {
+                 if (part.text) {
+                    fullText += part.text;
+                    onAnalysisUpdate(fullText, sources);
+                 }
               }
-            });
-            onAnalysisUpdate(fullText, sources);
-         }
+
+              if (parsed.candidates[0].groundingMetadata) {
+                 const webSources = parseGroundingSources(parsed.candidates[0].groundingMetadata);
+                 webSources.forEach(ws => {
+                   if (!sources.find(s => s.url === ws.url)) {
+                     sources.push(ws);
+                   }
+                 });
+                 onAnalysisUpdate(fullText, sources);
+              }
+            }
+          } catch (e) {
+            // Skip malformed JSON
+          }
+        }
       }
     }
   } catch (e) {
@@ -235,13 +324,13 @@ INSTRUCTIONS:
  * Main Orchestrator Function
  */
 export const generateAnalysisStream = async (
-  query: string, 
-  useDeepThinking: boolean, 
+  query: string,
+  useDeepThinking: boolean,
   mode: AnalysisMode,
   useWeb: boolean,
   onUpdate: (response: AnalysisResponse) => void
 ): Promise<void> => {
-  
+
   const staticSources: Source[] = KNOWLEDGE_BASE.slice(0, 5).map((k, i) => ({
     id: (i + 1).toString(),
     title: k.metadata.title,
